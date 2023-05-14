@@ -461,7 +461,14 @@ class LlamaModel(LlamaPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+        print(config)
+
         if hasattr(config, "mm_vision_tower"):
+            print("constructing vision_config")
+            from transformers import CLIPVisionConfig
+            self.vision_config = CLIPVisionConfig.from_pretrained(config.mm_vision_tower)
+
+        if hasattr(config, "use_mm_vision_tower"):
             from transformers import CLIPVisionModel
             self.vision_tower = [CLIPVisionModel.from_pretrained(config.mm_vision_tower)]
 
@@ -505,6 +512,7 @@ class LlamaModel(LlamaPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         images: Optional[torch.FloatTensor] = None,
+        images_embeds: Optional[torch.FloatTensor] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         r"""
@@ -583,50 +591,60 @@ class LlamaModel(LlamaPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
+        vision_config = getattr(self, 'vision_config', None)
         vision_tower = getattr(self, 'vision_tower', None)
-        if vision_tower is not None and (input_ids.shape[1] != 1 or self.training) and images is not None:
-            # TODO: this is a modified multimodal LLM -- Haotian Liu
-            vision_tower = vision_tower[0]  # HACK: for FSDP
-            with torch.no_grad():
-                if type(images) is list:
-                    # variable length images
-                    image_features = []
-                    for image in images:
-                        image_forward_out = vision_tower(image.unsqueeze(0), output_hidden_states=True)
+        if (input_ids.shape[1] != 1 or self.training) and (images is not None or images_embeds is not None):
+            
+            if images_embeds is not None:
+                image_features = images_embeds
+            elif images is not None:
+                if vision_tower is None:
+                    raise ValueError("If you are passing in images, vision tower must be initialised...")
+
+                # TODO: this is a modified multimodal LLM -- Haotian Liu
+                vision_tower = vision_tower[0]  # HACK: for FSDP
+                with torch.no_grad():
+                    if type(images) is list:
+                        # variable length images
+                        image_features = []
+                        for image in images:
+                            image_forward_out = vision_tower(image.unsqueeze(0), output_hidden_states=True)
+                            select_hidden_state_layer = getattr(self.config, "mm_vision_select_layer", -1)
+                            select_hidden_state = image_forward_out.hidden_states[select_hidden_state_layer]
+                            image_feature = select_hidden_state[:, 1:]
+                            image_features.append(image_feature)
+                    else:
+                        image_forward_outs = vision_tower(images, output_hidden_states=True)
                         select_hidden_state_layer = getattr(self.config, "mm_vision_select_layer", -1)
-                        select_hidden_state = image_forward_out.hidden_states[select_hidden_state_layer]
-                        image_feature = select_hidden_state[:, 1:]
-                        image_features.append(image_feature)
-                else:
-                    image_forward_outs = vision_tower(images, output_hidden_states=True)
-                    select_hidden_state_layer = getattr(self.config, "mm_vision_select_layer", -1)
-                    select_hidden_state = image_forward_outs.hidden_states[select_hidden_state_layer]
-                    image_features = select_hidden_state[:, 1:]
+                        select_hidden_state = image_forward_outs.hidden_states[select_hidden_state_layer]
+                        image_features = select_hidden_state[:, 1:]
+        
             if type(images) is list:
                 image_features = [self.mm_projector(image_feature)[0] for image_feature in image_features]
             else:
                 image_features = self.mm_projector(image_features)
+            
             dummy_image_features = torch.zeros(256, 1024, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
             dummy_image_features = self.mm_projector(dummy_image_features)
 
             new_input_embeds = []
             cur_image_idx = 0
             for cur_input_ids, cur_input_embeds in zip(input_ids, inputs_embeds):
-                if (cur_input_ids == vision_tower.config.im_patch_token).sum() == 0:
+                if (cur_input_ids == vision_config.im_patch_token).sum() == 0:
                     # multimodal LLM, but the current sample is not multimodal
                     cur_input_embeds = cur_input_embeds + (0. * dummy_image_features).sum()
                     new_input_embeds.append(cur_input_embeds)
                     continue
-                if vision_tower.config.use_im_start_end:
+                if vision_config.use_im_start_end:
                     cur_image_features = image_features[cur_image_idx]
                     num_patches = cur_image_features.shape[0]
-                    if (cur_input_ids == vision_tower.config.im_start_token).sum() != (cur_input_ids == vision_tower.config.im_end_token).sum():
+                    if (cur_input_ids == vision_config.im_start_token).sum() != (cur_input_ids == vision_config.im_end_token).sum():
                         raise ValueError("The number of im_start_token and im_end_token should be the same")
-                    image_start_tokens = torch.where(cur_input_ids == vision_tower.config.im_start_token)[0]
+                    image_start_tokens = torch.where(cur_input_ids == vision_config.im_start_token)[0]
                     for image_start_token_pos in image_start_tokens:
                         cur_image_features = image_features[cur_image_idx].to(device=cur_input_embeds.device)
                         num_patches = cur_image_features.shape[0]
-                        if cur_input_ids[image_start_token_pos + num_patches + 1] != vision_tower.config.im_end_token:
+                        if cur_input_ids[image_start_token_pos + num_patches + 1] != vision_config.im_end_token:
                             raise ValueError("Seems that the image is cut.")
                         cur_new_input_embeds = torch.cat((cur_input_embeds[:image_start_token_pos+1], cur_image_features, cur_input_embeds[image_start_token_pos + num_patches + 1:]), dim=0)
                         cur_image_idx += 1
@@ -634,9 +652,9 @@ class LlamaModel(LlamaPreTrainedModel):
                 else:
                     cur_image_features = image_features[cur_image_idx]
                     num_patches = cur_image_features.shape[0]
-                    if (cur_input_ids == vision_tower.config.im_patch_token).sum() != num_patches:
+                    if (cur_input_ids == vision_config.im_patch_token).sum() != num_patches:
                         raise ValueError("The number of im_patch_token should be the same as the number of patches")
-                    masked_indices = torch.where(cur_input_ids == vision_tower.config.im_patch_token)[0]
+                    masked_indices = torch.where(cur_input_ids == vision_config.im_patch_token)[0]
                     mask_index_start = masked_indices[0]
                     if (masked_indices != torch.arange(mask_index_start, mask_index_start+num_patches, device=masked_indices.device, dtype=masked_indices.dtype)).any():
                         raise ValueError("The im_patch_token should be continuous")
@@ -764,6 +782,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         images: Optional[torch.FloatTensor] = None,
+        images_embeds: Optional[torch.FloatTensor] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
@@ -850,7 +869,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            images=images
+            images=images,
+            images_embeds=images_embeds
         )
 
         hidden_states = outputs[0]
@@ -882,7 +902,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         )
 
     def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, images_embeds=None, **kwargs
     ):
         if past_key_values:
             input_ids = input_ids[:, -1:]
@@ -899,6 +919,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
                 "images": kwargs.get("images", None),
+                "images_embeds": kwargs.get("images_embeds", None),
             }
         )
         return model_inputs
